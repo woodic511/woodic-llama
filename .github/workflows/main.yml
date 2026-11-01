@@ -1,0 +1,707 @@
+name: Build Woodic llama AAR
+
+# Builds libwoodic-llama (current llama.cpp + JNI wrapper) as an Android AAR.
+# Run it from the Actions tab -> "Build Woodic llama AAR" -> Run workflow.
+# The finished file is attached to a Release called "aar-<run number>" (direct download).
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: "llama.cpp commit or tag (default: the version this wrapper was tested against)"
+        required: false
+        default: "dde879bc4f954b809892fd0d660515f42536394a"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: "17"
+          distribution: zulu
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          log-accepted-android-sdk-licenses: false
+
+      - name: Fetch llama.cpp
+        env:
+          LLAMA_REF: ${{ inputs.llama_ref }}
+        run: |
+          set -euo pipefail
+          mkdir llama.cpp
+          cd llama.cpp
+          git init -q
+          git remote add origin https://github.com/ggml-org/llama.cpp
+          git fetch --depth 1 origin "$LLAMA_REF"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='llama.cpp commit: %H (%cd)'
+
+      - name: Write Woodic sources into the upstream Android library module
+        run: |
+          set -euo pipefail
+          LIB=llama.cpp/examples/llama.android/lib
+
+          # remove upstream sample API (we ship our own, smaller one)
+          rm -rf "$LIB/src/main/java/com/arm"
+          rm -f  "$LIB/src/main/cpp/ai_chat.cpp"
+          mkdir -p "$LIB/src/main/java/com/woodic/llama"
+
+          cat > "$LIB/src/main/java/com/woodic/llama/WoodicLlama.java" <<'WOODIC_EOF_JAVA'
+          package com.woodic.llama;
+
+          /**
+           * Thin JNI wrapper around a current llama.cpp build (woodic-llama).
+           *
+           * Features compared to the old llama-android 0.1.1 library:
+           *  - real token streaming through {@link TokenCallback}
+           *  - real multi-turn chat: the model's own Jinja chat template is applied natively
+           *  - KV-cache reuse between turns (only new tokens are processed)
+           *  - cancellation that interrupts decoding immediately
+           *  - full sampler control (temperature, top-p, top-k, min-p, repeat penalty, seed)
+           *  - exact timing statistics
+           *
+           * All calls for one handle must be made from ONE thread at a time (except {@link #cancel}).
+           */
+          public final class WoodicLlama {
+
+              static {
+                  System.loadLibrary("woodic-llama");
+              }
+
+              private WoodicLlama() {}
+
+              /** Called for every decoded piece of text. Return false to stop generation. */
+              public interface TokenCallback {
+                  boolean onToken(String piece);
+              }
+
+              // ---- generate() result codes ----
+              public static final int RESULT_OK = 0;               // model finished by itself (EOG)
+              public static final int RESULT_MAX_TOKENS = 1;       // stopped because maxTokens reached
+              public static final int RESULT_CANCELLED = 2;        // cancel() or callback returned false
+              public static final int RESULT_CONTEXT_FULL = 3;     // context window is full
+              public static final int RESULT_TEMPLATE_ERROR = -1;  // chat template could not be applied
+              public static final int RESULT_PROMPT_TOO_LONG = -2; // prompt does not fit into the context
+              public static final int RESULT_DECODE_ERROR = -3;    // llama_process() failed
+              public static final int RESULT_BAD_HANDLE = -4;
+              public static final int RESULT_INTERNAL_ERROR = -9;
+
+              // ---- indexes of the stats array filled by generate() ----
+              public static final int STAT_PROMPT_TOKENS = 0;   // total prompt tokens
+              public static final int STAT_REUSED_TOKENS = 1;   // prompt tokens served from KV cache
+              public static final int STAT_GEN_TOKENS = 2;      // generated tokens
+              public static final int STAT_PROMPT_US = 3;       // microseconds spent on prompt processing
+              public static final int STAT_GEN_US = 4;          // microseconds spent on generation
+              public static final int STATS_SIZE = 5;
+
+              private static boolean initialised = false;
+
+              /** Must be called once, with context.getApplicationInfo().nativeLibraryDir. */
+              public static synchronized void init(String nativeLibDir) {
+                  if (initialised) return;
+                  nativeInit(nativeLibDir);
+                  initialised = true;
+              }
+
+              /** @return handle (> 0) or 0 on failure; see {@link #lastError()}. */
+              public static long load(String modelPath, int contextSize, int threads) {
+                  return nativeLoad(modelPath, contextSize, threads);
+              }
+
+              public static void free(long handle) {
+                  if (handle != 0) nativeFree(handle);
+              }
+
+              public static String lastError() {
+                  return nativeLastError();
+              }
+
+              public static String info(long handle) {
+                  return nativeInfo(handle);
+              }
+
+              public static String systemInfo() {
+                  return nativeSystemInfo();
+              }
+
+              /** Thread-safe: may be called from any thread while generate() runs. */
+              public static void cancel(long handle) {
+                  if (handle != 0) nativeCancel(handle);
+              }
+
+              /** Forget the KV cache (e.g. when a new conversation starts). */
+              public static void resetCache(long handle) {
+                  if (handle != 0) nativeResetCache(handle);
+              }
+
+              /**
+               * @param roles    "system" | "user" | "assistant"
+               * @param contents message texts (same length as roles)
+               * @param stats    array of length {@link #STATS_SIZE}, filled on return (may be null)
+               * @return one of the RESULT_* codes
+               */
+              public static int generate(long handle, String[] roles, String[] contents,
+                                         int maxTokens, float temperature, float topP, int topK,
+                                         float minP, float repeatPenalty, int seed, boolean thinking,
+                                         TokenCallback callback, long[] stats) {
+                  return nativeGenerate(handle, roles, contents, maxTokens, temperature, topP, topK,
+                          minP, repeatPenalty, seed, thinking, callback, stats);
+              }
+
+              private static native void nativeInit(String nativeLibDir);
+              private static native long nativeLoad(String modelPath, int contextSize, int threads);
+              private static native void nativeFree(long handle);
+              private static native String nativeLastError();
+              private static native String nativeInfo(long handle);
+              private static native String nativeSystemInfo();
+              private static native void nativeCancel(long handle);
+              private static native void nativeResetCache(long handle);
+              private static native int nativeGenerate(long handle, String[] roles, String[] contents,
+                                                       int maxTokens, float temperature, float topP, int topK,
+                                                       float minP, float repeatPenalty, int seed, boolean thinking,
+                                                       TokenCallback callback, long[] stats);
+          }
+
+          WOODIC_EOF_JAVA
+
+          cat > "$LIB/src/main/cpp/woodic_llama.cpp" <<'WOODIC_EOF_CPP'
+          // woodic-llama: JNI bridge over a current llama.cpp (llama + llama-common).
+          // Real token streaming, multi-turn chat templates (Jinja), KV-cache reuse, cancellation.
+
+          #include <android/log.h>
+          #include <jni.h>
+
+          #include <atomic>
+          #include <cstdint>
+          #include <cstring>
+          #include <exception>
+          #include <memory>
+          #include <mutex>
+          #include <sstream>
+          #include <string>
+          #include <vector>
+
+          #include "chat.h"
+          #include "common.h"
+          #include "llama.h"
+          #include "sampling.h"
+
+          #define LOG_TAG "WoodicLlama"
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+          #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          namespace {
+
+          constexpr int BATCH_SIZE = 512;
+
+          // result codes (keep in sync with WoodicLlama.java)
+          constexpr int R_OK = 0, R_MAX_TOKENS = 1, R_CANCELLED = 2, R_CONTEXT_FULL = 3;
+          constexpr int R_TEMPLATE = -1, R_TOO_LONG = -2, R_DECODE = -3, R_BAD_HANDLE = -4, R_INTERNAL = -9;
+
+          struct Engine {
+              llama_model *            model = nullptr;
+              llama_context *          ctx   = nullptr;
+              const llama_vocab *      vocab = nullptr;
+              common_batch             batch;
+              common_chat_templates_ptr tmpls;
+              std::vector<llama_token> cached;      // tokens currently held in the KV cache (sequence 0)
+              int                      n_ctx = 0;
+              int                      n_swa = 0;
+              std::atomic<bool>        cancel{false};
+          };
+
+          std::mutex   g_mutex;
+          bool         g_inited = false;
+          std::string  g_last_error;
+          std::string  g_last_log_error;
+          int          g_log_error_count = 0;
+
+          // ------------------------------------------------------------------ logging
+          void log_callback(ggml_log_level level, const char * text, void * /*user*/) {
+              if (!text) return;
+              int prio = ANDROID_LOG_INFO;
+              switch (level) {
+                  case GGML_LOG_LEVEL_ERROR: prio = ANDROID_LOG_ERROR; break;
+                  case GGML_LOG_LEVEL_WARN:  prio = ANDROID_LOG_WARN;  break;
+                  case GGML_LOG_LEVEL_DEBUG: prio = ANDROID_LOG_DEBUG; break;
+                  default: break;
+              }
+              __android_log_write(prio, "llama.cpp", text);
+              if (level == GGML_LOG_LEVEL_ERROR) {
+                  std::string s(text);
+                  while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+                  // keep the first few error lines: the first one is usually the real cause
+                  if (!s.empty() && g_log_error_count < 3) {
+                      if (!g_last_log_error.empty()) g_last_log_error += " | ";
+                      g_last_log_error += s;
+                      g_log_error_count++;
+                  }
+              }
+          }
+
+          // ------------------------------------------------------------------ UTF-8 / UTF-16 helpers
+          void append_utf8(std::string & out, uint32_t c) {
+              if (c < 0x80) {
+                  out += (char) c;
+              } else if (c < 0x800) {
+                  out += (char) (0xC0 | (c >> 6));
+                  out += (char) (0x80 | (c & 0x3F));
+              } else if (c < 0x10000) {
+                  out += (char) (0xE0 | (c >> 12));
+                  out += (char) (0x80 | ((c >> 6) & 0x3F));
+                  out += (char) (0x80 | (c & 0x3F));
+              } else {
+                  out += (char) (0xF0 | (c >> 18));
+                  out += (char) (0x80 | ((c >> 12) & 0x3F));
+                  out += (char) (0x80 | ((c >> 6) & 0x3F));
+                  out += (char) (0x80 | (c & 0x3F));
+              }
+          }
+
+          // Java String (UTF-16) -> standard UTF-8 (JNI's GetStringUTFChars gives *modified* UTF-8, which breaks emoji)
+          std::string jstring_to_utf8(JNIEnv * env, jstring js) {
+              std::string out;
+              if (!js) return out;
+              const jsize len = env->GetStringLength(js);
+              const jchar * chars = env->GetStringChars(js, nullptr);
+              if (!chars) return out;
+              out.reserve((size_t) len * 3 / 2 + 4);
+              for (jsize i = 0; i < len; i++) {
+                  uint32_t c = chars[i];
+                  if (c >= 0xD800 && c <= 0xDBFF && i + 1 < len) {
+                      uint32_t d = chars[i + 1];
+                      if (d >= 0xDC00 && d <= 0xDFFF) {
+                          c = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+                          i++;
+                      }
+                  }
+                  append_utf8(out, c);
+              }
+              env->ReleaseStringChars(js, chars);
+              return out;
+          }
+
+          // Consume all *complete* UTF-8 characters from the front of `buf` into `out` (UTF-16).
+          // An incomplete trailing sequence stays in `buf` (a token may split a multi-byte char).
+          // Invalid bytes become U+FFFD.
+          void decode_utf8_prefix(std::string & buf, std::u16string & out) {
+              size_t i = 0;
+              const size_t n = buf.size();
+              while (i < n) {
+                  const unsigned char b = (unsigned char) buf[i];
+                  uint32_t cp = 0;
+                  size_t need = 0;
+                  if (b < 0x80)                { cp = b;        need = 0; }
+                  else if ((b & 0xE0) == 0xC0) { cp = b & 0x1F; need = 1; }
+                  else if ((b & 0xF0) == 0xE0) { cp = b & 0x0F; need = 2; }
+                  else if ((b & 0xF8) == 0xF0) { cp = b & 0x07; need = 3; }
+                  else { out += (char16_t) 0xFFFD; i++; continue; }
+
+                  const size_t avail = n - i - 1;   // continuation bytes currently available
+                  size_t k = 0;
+                  bool bad = false;
+                  for (; k < need && k < avail; k++) {
+                      const unsigned char c = (unsigned char) buf[i + 1 + k];
+                      if ((c & 0xC0) != 0x80) { bad = true; break; }
+                      cp = (cp << 6) | (c & 0x3F);
+                  }
+                  if (bad) { out += (char16_t) 0xFFFD; i++; continue; }
+                  if (k < need) break;              // incomplete tail: wait for the next token
+
+                  if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+                      out += (char16_t) 0xFFFD;
+                  } else if (cp >= 0x10000) {
+                      cp -= 0x10000;
+                      out += (char16_t) (0xD800 + (cp >> 10));
+                      out += (char16_t) (0xDC00 + (cp & 0x3FF));
+                  } else {
+                      out += (char16_t) cp;
+                  }
+                  i += need + 1;
+              }
+              buf.erase(0, i);
+          }
+
+          jstring new_jstring(JNIEnv * env, const std::u16string & s) {
+              return env->NewString((const jchar *) s.data(), (jsize) s.size());
+          }
+
+          jstring new_jstring_utf8(JNIEnv * env, const std::string & utf8) {
+              std::string tmp = utf8;
+              std::u16string u16;
+              decode_utf8_prefix(tmp, u16);
+              if (!tmp.empty()) u16 += (char16_t) 0xFFFD;
+              return new_jstring(env, u16);
+          }
+
+          // ------------------------------------------------------------------ decoding
+          // returns 0 on success, 1 on decode failure, 2 when cancelled
+          int decode_tokens(Engine * e, const std::vector<llama_token> & tokens, size_t from, bool last_logits) {
+              const size_t total = tokens.size();
+              for (size_t i = from; i < total; i += BATCH_SIZE) {
+                  if (e->cancel.load()) return 2;
+                  const size_t n = std::min((size_t) BATCH_SIZE, total - i);
+                  e->batch.clear();
+                  for (size_t j = 0; j < n; j++) {
+                      const bool want_logit = last_logits && (i + j == total - 1);
+                      e->batch.add(tokens[i + j], (llama_pos) (i + j), 0, want_logit);
+                  }
+                  if (llama_process(e->ctx, LLAMA_PROCESS_TYPE_DECODE, e->batch.get()) != 0) {
+                      return 1;
+                  }
+              }
+              return 0;
+          }
+
+          void destroy_engine(Engine * e) {
+              if (!e) return;
+              e->tmpls.reset();
+              e->batch = common_batch();
+              if (e->ctx)   llama_free(e->ctx);
+              if (e->model) llama_model_free(e->model);
+              delete e;
+          }
+
+          } // namespace
+
+          // ====================================================================== JNI
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeInit(JNIEnv * env, jclass, jstring jdir) {
+              std::lock_guard<std::mutex> lock(g_mutex);
+              if (g_inited) return;
+              llama_log_set(log_callback, nullptr);
+              const std::string dir = jstring_to_utf8(env, jdir);
+              LOGI("Loading ggml backends from %s", dir.c_str());
+              ggml_backend_load_all_from_path(dir.c_str());
+              llama_backend_init();
+              g_inited = true;
+              LOGI("llama backend initialised");
+          }
+
+          extern "C" JNIEXPORT jlong JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeLoad(JNIEnv * env, jclass, jstring jpath, jint n_ctx_req, jint n_threads) {
+              g_last_error.clear();
+              g_last_log_error.clear();
+              g_log_error_count = 0;
+              try {
+                  const std::string path = jstring_to_utf8(env, jpath);
+
+                  llama_model_params mp = llama_model_default_params();
+                  llama_model * model = llama_model_load_from_file(path.c_str(), mp);
+                  if (!model) {
+                      g_last_error = g_last_log_error.empty() ? "llama.cpp could not load the model file" : g_last_log_error;
+                      return 0;
+                  }
+
+                  int n_ctx = n_ctx_req > 0 ? n_ctx_req : 4096;
+                  const int n_train = llama_model_n_ctx_train(model);
+                  if (n_train > 0 && n_ctx > n_train) n_ctx = n_train;
+
+                  llama_context_params cp = llama_context_default_params();
+                  cp.n_ctx           = (uint32_t) n_ctx;
+                  cp.n_batch         = BATCH_SIZE;
+                  cp.n_ubatch        = BATCH_SIZE;
+                  cp.n_threads       = n_threads > 0 ? n_threads : 4;
+                  cp.n_threads_batch = cp.n_threads;
+
+                  llama_context * ctx = llama_init_from_model(model, cp);
+                  if (!ctx) {
+                      g_last_error = g_last_log_error.empty()
+                              ? "could not create context (not enough RAM? try a smaller context size)" : g_last_log_error;
+                      llama_model_free(model);
+                      return 0;
+                  }
+
+                  auto * e = new Engine();
+                  e->model = model;
+                  e->ctx   = ctx;
+                  e->vocab = llama_model_get_vocab(model);
+                  e->batch = common_batch(ctx);
+                  e->tmpls = common_chat_templates_init(model, "");
+                  e->n_ctx = (int) llama_n_ctx(ctx);
+                  e->n_swa = llama_model_n_swa(model);
+                  LOGI("model loaded: n_ctx=%d n_swa=%d threads=%d", e->n_ctx, e->n_swa, cp.n_threads);
+                  return (jlong) (intptr_t) e;
+              } catch (const std::exception & ex) {
+                  g_last_error = std::string("exception while loading: ") + ex.what();
+              } catch (...) {
+                  g_last_error = "unknown exception while loading";
+              }
+              return 0;
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeFree(JNIEnv *, jclass, jlong handle) {
+              destroy_engine((Engine *) (intptr_t) handle);
+          }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeLastError(JNIEnv * env, jclass) {
+              return new_jstring_utf8(env, g_last_error);
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeCancel(JNIEnv *, jclass, jlong handle) {
+              auto * e = (Engine *) (intptr_t) handle;
+              if (e) e->cancel.store(true);
+          }
+
+          extern "C" JNIEXPORT void JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeResetCache(JNIEnv *, jclass, jlong handle) {
+              auto * e = (Engine *) (intptr_t) handle;
+              if (!e) return;
+              llama_memory_clear(llama_get_memory(e->ctx), false);
+              e->cached.clear();
+          }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeSystemInfo(JNIEnv * env, jclass) {
+              return new_jstring_utf8(env, llama_print_system_info());
+          }
+
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeInfo(JNIEnv * env, jclass, jlong handle) {
+              auto * e = (Engine *) (intptr_t) handle;
+              if (!e) return new_jstring_utf8(env, "");
+              char desc[256] = {0};
+              llama_model_desc(e->model, desc, sizeof(desc));
+              std::ostringstream ss;
+              ss << desc
+                 << " | " << (double) llama_model_size(e->model) / 1073741824.0 << " GiB"
+                 << " | " << (double) llama_model_n_params(e->model) / 1e9 << " B params"
+                 << " | n_ctx=" << e->n_ctx
+                 << " | n_ctx_train=" << llama_model_n_ctx_train(e->model)
+                 << " | vocab=" << llama_vocab_n_tokens(e->vocab);
+              return new_jstring_utf8(env, ss.str());
+          }
+
+          extern "C" JNIEXPORT jint JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeGenerate(
+                  JNIEnv * env, jclass, jlong handle,
+                  jobjectArray jroles, jobjectArray jcontents,
+                  jint max_tokens, jfloat temp, jfloat top_p, jint top_k, jfloat min_p, jfloat repeat_penalty,
+                  jint seed, jboolean thinking, jobject callback, jlongArray jstats) {
+
+              auto * e = (Engine *) (intptr_t) handle;
+              if (!e || !e->ctx) return R_BAD_HANDLE;
+              e->cancel.store(false);
+
+              jmethodID on_token = nullptr;
+              if (callback) {
+                  jclass cb_cls = env->GetObjectClass(callback);
+                  on_token = env->GetMethodID(cb_cls, "onToken", "(Ljava/lang/String;)Z");
+                  env->DeleteLocalRef(cb_cls);
+                  if (!on_token) { env->ExceptionClear(); return R_INTERNAL; }
+              }
+
+              int64_t st_prompt_tokens = 0, st_reused = 0, st_gen = 0, st_prompt_us = 0, st_gen_us = 0;
+              auto write_stats = [&]() {
+                  if (!jstats || env->GetArrayLength(jstats) < 5) return;
+                  jlong v[5] = { (jlong) st_prompt_tokens, (jlong) st_reused, (jlong) st_gen,
+                                 (jlong) st_prompt_us, (jlong) st_gen_us };
+                  env->SetLongArrayRegion(jstats, 0, 5, v);
+              };
+
+              common_sampler * smpl = nullptr;
+              int result = R_INTERNAL;
+
+              try {
+                  // ---- 1. messages -> prompt via the model's own chat template ----
+                  common_chat_templates_inputs inputs;
+                  const jsize n_msg = env->GetArrayLength(jroles);
+                  for (jsize i = 0; i < n_msg; i++) {
+                      auto jr = (jstring) env->GetObjectArrayElement(jroles, i);
+                      auto jc = (jstring) env->GetObjectArrayElement(jcontents, i);
+                      common_chat_msg m;
+                      m.role    = jstring_to_utf8(env, jr);
+                      m.content = jstring_to_utf8(env, jc);
+                      env->DeleteLocalRef(jr);
+                      env->DeleteLocalRef(jc);
+                      inputs.messages.push_back(std::move(m));
+                  }
+                  inputs.add_generation_prompt = true;
+                  inputs.use_jinja             = true;
+                  inputs.enable_thinking       = thinking == JNI_TRUE;
+
+                  std::string prompt;
+                  try {
+                      prompt = common_chat_templates_apply(e->tmpls.get(), inputs).prompt.str();
+                  } catch (const std::exception & ex) {
+                      LOGE("chat template failed: %s", ex.what());
+                      g_last_error = std::string("chat template error: ") + ex.what();
+                      return R_TEMPLATE;
+                  }
+                  if (prompt.empty()) return R_TEMPLATE;
+
+                  std::vector<llama_token> tokens = common_tokenize(e->vocab, prompt, /*add_special*/ true, /*parse_special*/ true);
+                  st_prompt_tokens = (int64_t) tokens.size();
+
+                  // ---- 2. context budget ----
+                  int max_new = max_tokens > 0 ? max_tokens : 512;
+                  if ((int) tokens.size() >= e->n_ctx - 16) { write_stats(); return R_TOO_LONG; }
+                  max_new = std::min(max_new, e->n_ctx - (int) tokens.size() - 4);
+                  if (max_new < 8) { write_stats(); return R_TOO_LONG; }
+
+                  // ---- 3. KV cache reuse (common prefix with previous turn) ----
+                  llama_memory_t mem = llama_get_memory(e->ctx);
+                  size_t n_past = 0;
+                  while (n_past < e->cached.size() && n_past < tokens.size() && e->cached[n_past] == tokens[n_past]) n_past++;
+                  if (n_past == tokens.size() && n_past > 0) n_past--;   // always re-decode the last token for logits
+
+                  if (n_past > 0) {
+                      bool ok = llama_memory_seq_rm(mem, 0, (llama_pos) n_past, -1);
+                      if (ok && e->n_swa > 0) {
+                          const llama_pos pmin = llama_memory_seq_pos_min(mem, 0);
+                          if (pmin > 0 && pmin > (llama_pos) n_past - e->n_swa) ok = false;  // window already evicted
+                      }
+                      if (!ok) { llama_memory_clear(mem, false); n_past = 0; }
+                  } else {
+                      llama_memory_clear(mem, false);
+                  }
+                  e->cached.assign(tokens.begin(), tokens.begin() + (long) n_past);
+                  st_reused = (int64_t) n_past;
+
+                  // ---- 4. prefill ----
+                  const int64_t t0 = ggml_time_us();
+                  const int pr = decode_tokens(e, tokens, n_past, /*last_logits*/ true);
+                  st_prompt_us = ggml_time_us() - t0;
+                  if (pr == 2) { e->cached.clear(); llama_memory_clear(mem, false); write_stats(); return R_CANCELLED; }
+                  if (pr != 0) { e->cached.clear(); llama_memory_clear(mem, false); write_stats(); return R_DECODE; }
+                  e->cached = tokens;
+
+                  // ---- 5. sampler ----
+                  common_params_sampling sp;
+                  sp.temp           = temp;
+                  sp.top_k          = top_k;
+                  sp.top_p          = top_p;
+                  sp.min_p          = min_p;
+                  sp.penalty_repeat = repeat_penalty;
+                  if (seed >= 0) sp.seed = (uint32_t) seed;
+                  smpl = common_sampler_init(e->model, sp);
+                  if (!smpl) return R_INTERNAL;
+
+                  // ---- 6. generation loop with streaming ----
+                  std::string pending_bytes;
+                  std::u16string out16;
+                  llama_pos pos = (llama_pos) tokens.size();
+                  const int64_t g0 = ggml_time_us();
+                  result = R_MAX_TOKENS;
+
+                  auto flush = [&](bool force) -> bool {   // returns false if the Java side asked to stop
+                      decode_utf8_prefix(pending_bytes, out16);
+                      if (force && !pending_bytes.empty()) { out16 += (char16_t) 0xFFFD; pending_bytes.clear(); }
+                      if (out16.empty() || !on_token) { out16.clear(); return true; }
+                      jstring js = new_jstring(env, out16);
+                      out16.clear();
+                      if (!js) return true;
+                      const jboolean cont = env->CallBooleanMethod(callback, on_token, js);
+                      env->DeleteLocalRef(js);
+                      if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
+                      return cont == JNI_TRUE;
+                  };
+
+                  for (int n_gen = 0; n_gen < max_new; ) {
+                      if (e->cancel.load()) { result = R_CANCELLED; break; }
+                      if (pos + 1 >= e->n_ctx) { result = R_CONTEXT_FULL; break; }
+
+                      const llama_token id = common_sampler_sample(smpl, e->ctx, -1);
+                      common_sampler_accept(smpl, id, true);
+
+                      if (llama_vocab_is_eog(e->vocab, id)) { result = R_OK; break; }
+
+                      pending_bytes += common_token_to_piece(e->ctx, id, /*special*/ false);
+                      if (!flush(false)) { result = R_CANCELLED; /* token still gets decoded below to keep cache consistent */ }
+
+                      e->batch.clear();
+                      e->batch.add(id, pos, 0, true);
+                      if (llama_process(e->ctx, LLAMA_PROCESS_TYPE_DECODE, e->batch.get()) != 0) {
+                          result = R_DECODE;
+                          e->cached.clear();
+                          llama_memory_clear(mem, false);
+                          break;
+                      }
+                      e->cached.push_back(id);
+                      pos++;
+                      n_gen++;
+                      st_gen = n_gen;
+                      if (result == R_CANCELLED) break;
+                  }
+                  st_gen_us = ggml_time_us() - g0;
+                  flush(true);
+              } catch (const std::exception & ex) {
+                  LOGE("generate exception: %s", ex.what());
+                  g_last_error = ex.what();
+                  result = R_INTERNAL;
+              } catch (...) {
+                  LOGE("generate: unknown exception");
+                  result = R_INTERNAL;
+              }
+
+              if (smpl) common_sampler_free(smpl);
+              write_stats();
+              return result;
+          }
+          WOODIC_EOF_CPP
+
+          # point the build at our sources / names
+          sed -i 's/project("ai-chat"/project("woodic-llama"/; s/ai_chat\.cpp/woodic_llama.cpp/' "$LIB/src/main/cpp/CMakeLists.txt"
+          # OpenMP would need libomp.so packaged next to the backends; ggml's own thread pool is enough
+          sed -i 's/set(GGML_OPENMP ON)/set(GGML_OPENMP OFF)/' "$LIB/src/main/cpp/CMakeLists.txt"
+          sed -i 's/namespace = "com.arm.aichat"/namespace = "com.woodic.llama"/; s/minSdk = 33/minSdk = 24/; s/listOf("arm64-v8a", "x86_64")/listOf("arm64-v8a")/; s/CMAKE_VERBOSE_MAKEFILE=ON/CMAKE_VERBOSE_MAKEFILE=OFF/; s/CMAKE_MESSAGE_LOG_LEVEL=DEBUG/CMAKE_MESSAGE_LOG_LEVEL=STATUS/' "$LIB/build.gradle.kts"
+          printf '%s\n' '-keep class com.woodic.llama.** { *; }' '-keepclasseswithmembernames class * { native <methods>; }' > "$LIB/consumer-rules.pro"
+
+          echo "--- patched CMakeLists.txt (relevant lines)"
+          grep -n 'project(\|woodic_llama\|GGML_OPENMP' "$LIB/src/main/cpp/CMakeLists.txt"
+          echo "--- patched build.gradle.kts (relevant lines)"
+          grep -n 'namespace\|minSdk\|abiFilters\|VERBOSE\|LOG_LEVEL' "$LIB/build.gradle.kts"
+          grep -q 'woodic_llama.cpp' "$LIB/src/main/cpp/CMakeLists.txt"
+          grep -q 'com.woodic.llama' "$LIB/build.gradle.kts"
+
+      - name: Build AAR (this compiles llama.cpp for arm64 and takes a while)
+        working-directory: llama.cpp/examples/llama.android
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :lib:assembleRelease --no-daemon --console=plain
+
+      - name: Check and name the AAR
+        run: |
+          set -euo pipefail
+          SRC=$(find llama.cpp/examples/llama.android/lib/build/outputs/aar -name '*release*.aar' | head -n 1)
+          test -n "$SRC"
+          mkdir -p out
+          cp "$SRC" out/woodic-llama.aar
+          echo "--- AAR contents"
+          unzip -l out/woodic-llama.aar
+          unzip -l out/woodic-llama.aar | grep -q 'classes.jar'
+          unzip -l out/woodic-llama.aar | grep -q 'jni/arm64-v8a/libwoodic-llama.so'
+          unzip -l out/woodic-llama.aar | grep -q 'jni/arm64-v8a/libllama.so'
+          unzip -p out/woodic-llama.aar classes.jar > out/classes.jar
+          unzip -l out/classes.jar | grep -q 'com/woodic/llama/WoodicLlama.class'
+          ls -l out
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: woodic-llama-aar
+          path: out/woodic-llama.aar
+
+      - name: Publish release (direct .aar download link)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "aar-${{ github.run_number }}" out/woodic-llama.aar \
+            --repo "${{ github.repository }}" \
+            --title "woodic-llama AAR #${{ github.run_number }}" \
+            --notes "llama.cpp ref: ${{ inputs.llama_ref }}"
