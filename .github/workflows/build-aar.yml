@@ -78,9 +78,14 @@ jobs:
 
               private WoodicLlama() {}
 
-              /** Called for every decoded piece of text. Return false to stop generation. */
+              /**
+               * Called with every new piece of text.
+               * @param isReasoning true if the piece belongs to the model's thinking, false for the answer
+               * @param tokenCount  number of tokens generated so far (for live tokens/second)
+               * @return false to stop generation
+               */
               public interface TokenCallback {
-                  boolean onToken(String piece);
+                  boolean onToken(String piece, boolean isReasoning, int tokenCount);
               }
 
               // ---- generate() result codes ----
@@ -111,9 +116,27 @@ jobs:
                   initialised = true;
               }
 
+              // ---- flash attention modes ----
+              public static final int FLASH_AUTO = 0, FLASH_ON = 1, FLASH_OFF = 2;
+              // ---- KV cache types ----
+              public static final int KV_F16 = 0, KV_Q8_0 = 1, KV_Q4_0 = 2;
+
               /** @return handle (> 0) or 0 on failure; see {@link #lastError()}. */
               public static long load(String modelPath, int contextSize, int threads) {
-                  return nativeLoad(modelPath, contextSize, threads);
+                  return nativeLoad(modelPath, contextSize, threads, threads, 512, FLASH_AUTO, KV_F16);
+              }
+
+              /**
+               * Full control over performance parameters.
+               * @param threads      threads used while generating tokens
+               * @param threadsBatch threads used while processing the prompt (usually more than {@code threads})
+               * @param batchSize    prompt batch size (32..2048)
+               * @param flashAttn    FLASH_AUTO / FLASH_ON / FLASH_OFF
+               * @param kvType       KV_F16 / KV_Q8_0 / KV_Q4_0 (quantized caches save RAM, need flash attention)
+               */
+              public static long load(String modelPath, int contextSize, int threads, int threadsBatch,
+                                      int batchSize, int flashAttn, int kvType) {
+                  return nativeLoad(modelPath, contextSize, threads, threadsBatch, batchSize, flashAttn, kvType);
               }
 
               public static void free(long handle) {
@@ -126,6 +149,11 @@ jobs:
 
               public static String info(long handle) {
                   return nativeInfo(handle);
+              }
+
+              /** Does the model's chat template support switching thinking on/off? */
+              public static boolean supportsThinking(long handle) {
+                  return handle != 0 && nativeSupportsThinking(handle);
               }
 
               public static String systemInfo() {
@@ -157,11 +185,13 @@ jobs:
               }
 
               private static native void nativeInit(String nativeLibDir);
-              private static native long nativeLoad(String modelPath, int contextSize, int threads);
+              private static native long nativeLoad(String modelPath, int contextSize, int threads,
+                                                    int threadsBatch, int batchSize, int flashAttn, int kvType);
               private static native void nativeFree(long handle);
               private static native String nativeLastError();
               private static native String nativeInfo(long handle);
               private static native String nativeSystemInfo();
+              private static native boolean nativeSupportsThinking(long handle);
               private static native void nativeCancel(long handle);
               private static native void nativeResetCache(long handle);
               private static native int nativeGenerate(long handle, String[] roles, String[] contents,
@@ -169,7 +199,6 @@ jobs:
                                                        float minP, float repeatPenalty, int seed, boolean thinking,
                                                        TokenCallback callback, long[] stats);
           }
-
           WOODIC_EOF_JAVA
 
           cat > "$LIB/src/main/cpp/woodic_llama.cpp" <<'WOODIC_EOF_CPP'
@@ -201,7 +230,7 @@ jobs:
 
           namespace {
 
-          constexpr int BATCH_SIZE = 512;
+          constexpr int DEFAULT_BATCH = 512;
 
           // result codes (keep in sync with WoodicLlama.java)
           constexpr int R_OK = 0, R_MAX_TOKENS = 1, R_CANCELLED = 2, R_CONTEXT_FULL = 3;
@@ -216,6 +245,7 @@ jobs:
               std::vector<llama_token> cached;      // tokens currently held in the KV cache (sequence 0)
               int                      n_ctx = 0;
               int                      n_swa = 0;
+              int                      n_batch = DEFAULT_BATCH;
               std::atomic<bool>        cancel{false};
           };
 
@@ -331,6 +361,23 @@ jobs:
               buf.erase(0, i);
           }
 
+          std::string utf16_to_utf8(const std::u16string & u) {
+              std::string out;
+              out.reserve(u.size() * 2);
+              for (size_t i = 0; i < u.size(); i++) {
+                  uint32_t c = u[i];
+                  if (c >= 0xD800 && c <= 0xDBFF && i + 1 < u.size()) {
+                      uint32_t d = u[i + 1];
+                      if (d >= 0xDC00 && d <= 0xDFFF) {
+                          c = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+                          i++;
+                      }
+                  }
+                  append_utf8(out, c);
+              }
+              return out;
+          }
+
           jstring new_jstring(JNIEnv * env, const std::u16string & s) {
               return env->NewString((const jchar *) s.data(), (jsize) s.size());
           }
@@ -347,9 +394,10 @@ jobs:
           // returns 0 on success, 1 on decode failure, 2 when cancelled
           int decode_tokens(Engine * e, const std::vector<llama_token> & tokens, size_t from, bool last_logits) {
               const size_t total = tokens.size();
-              for (size_t i = from; i < total; i += BATCH_SIZE) {
+              const size_t step = (size_t) std::max(1, e->n_batch);
+              for (size_t i = from; i < total; i += step) {
                   if (e->cancel.load()) return 2;
-                  const size_t n = std::min((size_t) BATCH_SIZE, total - i);
+                  const size_t n = std::min(step, total - i);
                   e->batch.clear();
                   for (size_t j = 0; j < n; j++) {
                       const bool want_logit = last_logits && (i + j == total - 1);
@@ -389,7 +437,8 @@ jobs:
           }
 
           extern "C" JNIEXPORT jlong JNICALL
-          Java_com_woodic_llama_WoodicLlama_nativeLoad(JNIEnv * env, jclass, jstring jpath, jint n_ctx_req, jint n_threads) {
+          Java_com_woodic_llama_WoodicLlama_nativeLoad(JNIEnv * env, jclass, jstring jpath, jint n_ctx_req, jint n_threads,
+                                                        jint n_threads_batch, jint n_batch_req, jint flash_attn, jint kv_type) {
               g_last_error.clear();
               g_last_log_error.clear();
               g_log_error_count = 0;
@@ -407,17 +456,34 @@ jobs:
                   const int n_train = llama_model_n_ctx_train(model);
                   if (n_train > 0 && n_ctx > n_train) n_ctx = n_train;
 
+                  const int n_batch = std::max(32, std::min(n_batch_req > 0 ? (int) n_batch_req : DEFAULT_BATCH, 2048));
+
                   llama_context_params cp = llama_context_default_params();
                   cp.n_ctx           = (uint32_t) n_ctx;
-                  cp.n_batch         = BATCH_SIZE;
-                  cp.n_ubatch        = BATCH_SIZE;
+                  cp.n_batch         = (uint32_t) n_batch;
+                  cp.n_ubatch        = (uint32_t) std::min(n_batch, 1024);
                   cp.n_threads       = n_threads > 0 ? n_threads : 4;
-                  cp.n_threads_batch = cp.n_threads;
+                  cp.n_threads_batch = n_threads_batch > 0 ? n_threads_batch : cp.n_threads;
+
+                  // flash attention: 0 = auto, 1 = on, 2 = off
+                  cp.flash_attn_type = flash_attn == 1 ? LLAMA_FLASH_ATTN_TYPE_ENABLED
+                                     : flash_attn == 2 ? LLAMA_FLASH_ATTN_TYPE_DISABLED
+                                                       : LLAMA_FLASH_ATTN_TYPE_AUTO;
+                  // KV cache type: 0 = f16, 1 = q8_0, 2 = q4_0 (a quantized V cache needs flash attention)
+                  ggml_type kvt = GGML_TYPE_F16;
+                  if (kv_type == 1) kvt = GGML_TYPE_Q8_0;
+                  else if (kv_type == 2) kvt = GGML_TYPE_Q4_0;
+                  cp.type_k = kvt;
+                  cp.type_v = kvt;
+                  if (kvt != GGML_TYPE_F16 && cp.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+                      LOGW("quantized KV cache requires flash attention -> forcing it on");
+                      cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                  }
 
                   llama_context * ctx = llama_init_from_model(model, cp);
                   if (!ctx) {
                       g_last_error = g_last_log_error.empty()
-                              ? "could not create context (not enough RAM? try a smaller context size)" : g_last_log_error;
+                              ? "could not create context (not enough RAM? try a smaller context size or batch size)" : g_last_log_error;
                       llama_model_free(model);
                       return 0;
                   }
@@ -430,7 +496,9 @@ jobs:
                   e->tmpls = common_chat_templates_init(model, "");
                   e->n_ctx = (int) llama_n_ctx(ctx);
                   e->n_swa = llama_model_n_swa(model);
-                  LOGI("model loaded: n_ctx=%d n_swa=%d threads=%d", e->n_ctx, e->n_swa, cp.n_threads);
+                  e->n_batch = n_batch;
+                  LOGI("model loaded: n_ctx=%d n_swa=%d threads=%d/%d n_batch=%d fa=%d kv=%d",
+                       e->n_ctx, e->n_swa, cp.n_threads, cp.n_threads_batch, n_batch, (int) cp.flash_attn_type, kv_type);
                   return (jlong) (intptr_t) e;
               } catch (const std::exception & ex) {
                   g_last_error = std::string("exception while loading: ") + ex.what();
@@ -462,6 +530,17 @@ jobs:
               if (!e) return;
               llama_memory_clear(llama_get_memory(e->ctx), false);
               e->cached.clear();
+          }
+
+          extern "C" JNIEXPORT jboolean JNICALL
+          Java_com_woodic_llama_WoodicLlama_nativeSupportsThinking(JNIEnv *, jclass, jlong handle) {
+              auto * e = (Engine *) (intptr_t) handle;
+              if (!e || !e->tmpls) return JNI_FALSE;
+              try {
+                  return common_chat_templates_support_enable_thinking(e->tmpls.get()) ? JNI_TRUE : JNI_FALSE;
+              } catch (...) {
+                  return JNI_FALSE;
+              }
           }
 
           extern "C" JNIEXPORT jstring JNICALL
@@ -499,7 +578,7 @@ jobs:
               jmethodID on_token = nullptr;
               if (callback) {
                   jclass cb_cls = env->GetObjectClass(callback);
-                  on_token = env->GetMethodID(cb_cls, "onToken", "(Ljava/lang/String;)Z");
+                  on_token = env->GetMethodID(cb_cls, "onToken", "(Ljava/lang/String;ZI)Z");
                   env->DeleteLocalRef(cb_cls);
                   if (!on_token) { env->ExceptionClear(); return R_INTERNAL; }
               }
@@ -516,7 +595,7 @@ jobs:
               int result = R_INTERNAL;
 
               try {
-                  // ---- 1. messages -> prompt via the model's own chat template ----
+                  // ---- 1. messages -> prompt via the model's own chat template (+ streaming reasoning parser) ----
                   common_chat_templates_inputs inputs;
                   const jsize n_msg = env->GetArrayLength(jroles);
                   for (jsize i = 0; i < n_msg; i++) {
@@ -532,10 +611,15 @@ jobs:
                   inputs.add_generation_prompt = true;
                   inputs.use_jinja             = true;
                   inputs.enable_thinking       = thinking == JNI_TRUE;
+                  // always split reasoning from the answer (a model that thinks even when asked not to
+                  // must not pollute the answer with its thoughts)
+                  inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
 
+                  std::unique_ptr<common_chat_session> session;
                   std::string prompt;
                   try {
-                      prompt = common_chat_templates_apply(e->tmpls.get(), inputs).prompt.str();
+                      session = std::make_unique<common_chat_session>(e->tmpls.get(), e->vocab, inputs);
+                      prompt  = session->prompt().str();
                   } catch (const std::exception & ex) {
                       LOGE("chat template failed: %s", ex.what());
                       g_last_error = std::string("chat template error: ") + ex.what();
@@ -591,23 +675,47 @@ jobs:
                   if (!smpl) return R_INTERNAL;
 
                   // ---- 6. generation loop with streaming ----
-                  std::string pending_bytes;
-                  std::u16string out16;
+                  std::string pending_bytes;                 // bytes of an incomplete UTF-8 character
+                  common_chat_msg prev_msg;
+                  prev_msg.role = "assistant";
                   llama_pos pos = (llama_pos) tokens.size();
                   const int64_t g0 = ggml_time_us();
                   result = R_MAX_TOKENS;
+                  bool java_stop = false;
+                  int  emit_tokens = 0;                      // tokens generated so far (reported to the callback)
 
-                  auto flush = [&](bool force) -> bool {   // returns false if the Java side asked to stop
-                      decode_utf8_prefix(pending_bytes, out16);
-                      if (force && !pending_bytes.empty()) { out16 += (char16_t) 0xFFFD; pending_bytes.clear(); }
-                      if (out16.empty() || !on_token) { out16.clear(); return true; }
-                      jstring js = new_jstring(env, out16);
-                      out16.clear();
-                      if (!js) return true;
-                      const jboolean cont = env->CallBooleanMethod(callback, on_token, js);
+                  auto emit = [&](const std::string & utf8, bool is_reasoning) {
+                      if (utf8.empty() || !on_token || java_stop) return;
+                      jstring js = new_jstring_utf8(env, utf8);
+                      if (!js) return;
+                      const jboolean cont = env->CallBooleanMethod(callback, on_token, js, is_reasoning ? JNI_TRUE : JNI_FALSE, (jint) emit_tokens);
                       env->DeleteLocalRef(js);
-                      if (env->ExceptionCheck()) { env->ExceptionClear(); return false; }
-                      return cont == JNI_TRUE;
+                      if (env->ExceptionCheck()) { env->ExceptionClear(); java_stop = true; return; }
+                      if (cont != JNI_TRUE) java_stop = true;
+                  };
+
+                  auto publish = [&](const common_chat_msg & cur) {
+                      std::string r_delta, c_delta;
+                      for (const auto & d : common_chat_msg_diff::compute_diffs(prev_msg, cur)) {
+                          r_delta += d.reasoning_content_delta;
+                          c_delta += d.content_delta;
+                      }
+                      prev_msg = cur;
+                      emit(r_delta, true);
+                      emit(c_delta, false);
+                  };
+
+                  // feeds all *complete* characters of pending_bytes into the chat parser
+                  auto feed_pending = [&]() {
+                      std::u16string u16;
+                      decode_utf8_prefix(pending_bytes, u16);
+                      if (u16.empty()) return;
+                      const std::string chunk = utf16_to_utf8(u16);
+                      try {
+                          publish(session->feed(common_chat_input(chunk)));
+                      } catch (const std::exception & ex) {
+                          LOGW("chat parser feed failed: %s", ex.what());
+                      }
                   };
 
                   for (int n_gen = 0; n_gen < max_new; ) {
@@ -619,8 +727,11 @@ jobs:
 
                       if (llama_vocab_is_eog(e->vocab, id)) { result = R_OK; break; }
 
-                      pending_bytes += common_token_to_piece(e->ctx, id, /*special*/ false);
-                      if (!flush(false)) { result = R_CANCELLED; /* token still gets decoded below to keep cache consistent */ }
+                      // special tokens are kept in the text: the parser needs them to find thinking boundaries
+                      pending_bytes += common_token_to_piece(e->ctx, id, /*special*/ true);
+                      emit_tokens = n_gen + 1;
+                      feed_pending();
+                      if (java_stop) { result = R_CANCELLED; /* still decode this token so the cache stays consistent */ }
 
                       e->batch.clear();
                       e->batch.add(id, pos, 0, true);
@@ -637,7 +748,16 @@ jobs:
                       if (result == R_CANCELLED) break;
                   }
                   st_gen_us = ggml_time_us() - g0;
-                  flush(true);
+
+                  // flush: finalize the parse (it may release text the parser was holding back)
+                  emit_tokens = (int) st_gen;
+                  if (result != R_CANCELLED) {
+                      try {
+                          publish(session->finish());
+                      } catch (const std::exception & ex) {
+                          LOGW("chat parser finish failed: %s", ex.what());
+                      }
+                  }
               } catch (const std::exception & ex) {
                   LOGE("generate exception: %s", ex.what());
                   g_last_error = ex.what();
